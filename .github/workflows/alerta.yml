@@ -7,8 +7,11 @@ on:
   workflow_dispatch:
     inputs:
       modo:
-        description: "run / test / backtest"
+        description: "run / test / backtest / historico"
         default: "run"
+      dias:
+        description: "Días de historial (solo para modo historico)"
+        default: "365"
 
 permissions:
   contents: write
@@ -20,6 +23,7 @@ concurrency:
 jobs:
   revisar:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -28,15 +32,20 @@ jobs:
           TWELVEDATA_KEY: ${{ secrets.TWELVEDATA_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
           MODO: ${{ inputs.modo }}
+          DIAS: ${{ inputs.dias }}
         run: python3 detector.py "${MODO:-run}"
 
-      - name: Guardar estado
+      - name: Guardar estado y datos
+        if: always()
         run: |
-          if [ -n "$(git status --porcelain state.json)" ]; then
+          git add -A
+          if [ -n "$(git status --porcelain)" ]; then
             git config user.name "bot"
             git config user.email "bot@users.noreply.github.com"
-            git add state.json
-            git commit -m "estado"
+            git commit -m "datos"
             git push
           fi
