@@ -5,8 +5,11 @@ Uso:
     python3 detector.py test       -> manda un mensaje de prueba (email y/o Telegram)
     python3 detector.py backtest   -> alertas de los últimos ~7 días (rápido)
     python3 detector.py historico  -> análisis de DIAS días (por defecto 365): CSV + resumen
+    python3 detector.py estabilidad -> compara 1ª y 2ª mitad del histórico (sin gastar créditos de datos)
+    python3 detector.py confirmacion -> analiza la entrada al romper el piso de la acumulación (velas de 5m)
 """
 import csv
+import bisect
 import json
 import math
 import os
@@ -80,8 +83,8 @@ def _parse(values):
     return out
 
 
-def api(symbol, size, end_date=None):
-    params = {"symbol": symbol, "interval": INTERVAL, "outputsize": size,
+def api(symbol, size, end_date=None, interval=None):
+    params = {"symbol": symbol, "interval": interval or INTERVAL, "outputsize": size,
               "timezone": "UTC", "apikey": os.environ["TWELVEDATA_KEY"]}
     if end_date:
         params["end_date"] = end_date
@@ -93,8 +96,8 @@ def api(symbol, size, end_date=None):
     return _parse(data["values"])
 
 
-def _quitar_vela_abierta(c):
-    if c and c[-1]["t"] + timedelta(minutes=CANDLE_MIN) > datetime.now(timezone.utc):
+def _quitar_vela_abierta(c, minutos=CANDLE_MIN):
+    if c and c[-1]["t"] + timedelta(minutes=minutos) > datetime.now(timezone.utc):
         c.pop()
     return c
 
@@ -104,12 +107,12 @@ def fetch(symbol, size=120):
     return _quitar_vela_abierta(c)
 
 
-def fetch_historial(symbol, dias):
+def fetch_historial(symbol, dias, interval=None, minutos=CANDLE_MIN):
     todas = {}
     end = None
-    for _ in range(40):
+    for _ in range(60):
         try:
-            lote = api(symbol, 5000, end)
+            lote = api(symbol, 5000, end, interval)
         except RuntimeError as e:
             if todas:
                 print(f"Aviso: el historial se corta aquí ({e})")
@@ -127,7 +130,7 @@ def fetch_historial(symbol, dias):
         time.sleep(8)  # el plan gratis permite 8 llamadas por minuto
     corte = datetime.now(timezone.utc) - timedelta(days=dias)
     c = sorted((x for x in todas.values() if x["t"] >= corte), key=lambda x: x["t"])
-    return _quitar_vela_abierta(c)
+    return _quitar_vela_abierta(c, minutos)
 
 
 # ------------------------------------------------------------------ patrón
@@ -184,6 +187,7 @@ def detect(c):
             "key": zone[peak_i]["t"].isoformat(), "vela_t": c[-1]["t"],
             "acc": acc, "atr": a, "impulse": impulse, "base": base, "peak": peak,
             "acc_hi": acc_hi, "acc_lo": acc_lo, "price": price,
+            "acc_body_lo": min(min(x["o"], x["c"]) for x in win),
             "frac": (acc_hi - acc_lo) / impulse,
             "eff": impulse / suma_r,
             "mechas": (suma_r - sum(cuerpos)) / suma_r,
@@ -569,6 +573,364 @@ def actualizar_vivo(sym, c):
         _guardar_vivo(filas)
 
 
+
+# ------------------------------------------------------------------ estabilidad (sin API)
+def estabilidad(sym):
+    """Lee datos/historico_*.csv y comprueba si los filtros se mantienen en la 1ª y 2ª mitad del periodo."""
+    nombre = sym.replace("/", "")
+    ruta = os.path.join(DATA_DIR, f"historico_{nombre}.csv")
+    with open(ruta, newline="") as f:
+        filas = list(csv.DictReader(f))
+    rows, poco_riesgo = [], 0
+    minimo = 3 * SPREAD.get(sym, 0.0)  # un SL a menos de 3 spreads no es operable
+    for r in filas:
+        if r["estado"] != "ok" or r["viernes_tarde"] == "1" or r["exito_ref"] == "":
+            continue
+        if float(r["riesgo_pts"]) < minimo:
+            poco_riesgo += 1
+            continue
+        t = datetime.strptime(r["vela_t"], "%Y-%m-%d %H:%M")
+        rows.append({"t": t, "setup": int(r["setup"]), "sesion": r["sesion"], "hora": t.hour,
+                     "deriva": float(r["deriva_atr"]), "ok": int(r["exito_ref"]), "r50": int(r["exito_r50"])})
+    rows.sort(key=lambda x: x["t"])
+    if len(rows) < 60:
+        return "Muy pocas alertas en el CSV para comparar mitades."
+    vistos = set()
+    for x in rows:
+        x["primera"] = x["setup"] not in vistos
+        vistos.add(x["setup"])
+    mitad = rows[0]["t"] + (rows[-1]["t"] - rows[0]["t"]) / 2
+    h1 = [x for x in rows if x["t"] < mitad]
+    h2 = [x for x in rows if x["t"] >= mitad]
+    v1 = sorted(x["deriva"] for x in h1)
+    corte = v1[len(v1) // 3]  # el corte se fija solo con la 1ª mitad (sin mirar la 2ª)
+
+    filtros = [
+        ("Todas (referencia)", lambda x: True, 0),
+        ("Nueva York+Londres", lambda x: x["sesion"] == "Nueva York+Londres", 1),
+        ("12 a 16h UTC", lambda x: 12 <= x["hora"] < 16, 1),
+        (f"Deriva baja (< {corte:.2f} ATR)", lambda x: x["deriva"] < corte, 1),
+        ("NY+Londres y deriva baja", lambda x: x["sesion"] == "Nueva York+Londres" and x["deriva"] < corte, 1),
+        ("Fuera de sesión", lambda x: x["sesion"] == "Fuera", -1),
+    ]
+
+    def celda(lst):
+        n = len(lst)
+        if not n:
+            return "–", 0.0, 0
+        p = sum(x["ok"] for x in lst) / n
+        return f"{100 * p:.0f}% (n={n})" + ("⚠" if n < 30 else ""), p, n
+
+    def tabla(sub1, sub2):
+        _, b1, _ = celda(sub1)
+        _, b2, _ = celda(sub2)
+        filas_t = []
+        for nombre_f, fn, signo in filtros:
+            c1, p1, n1 = celda([x for x in sub1 if fn(x)])
+            c2, p2, n2 = celda([x for x in sub2 if fn(x)])
+            if signo == 0:
+                ver = ""
+            elif n1 < 20 or n2 < 20:
+                ver = "pocos casos"
+            else:
+                d1, d2 = signo * (p1 - b1), signo * (p2 - b2)
+                if d1 >= 0.05 and d2 >= 0.05:
+                    ver = "se mantiene"
+                elif d1 >= 0.05 or d2 >= 0.05:
+                    ver = "solo en una mitad"
+                else:
+                    ver = "no se mantiene"
+            filas_t.append([nombre_f, c1, c2, ver])
+        return _tabla(["Filtro", "1ª mitad", "2ª mitad", "Veredicto"], filas_t)
+
+    L = [f"# {sym} — ¿se mantienen los filtros? (1ª vs 2ª mitad)", "",
+         f"- Excluidas por riesgo menor a 3 veces el spread (SL demasiado pegado, no operable): {poco_riesgo}",
+         f"- Alertas evaluadas (sin viernes tarde): {len(rows)} | 1ª mitad: {len(h1)} ({h1[0]['t']:%Y-%m-%d} a {mitad:%Y-%m-%d}) | "
+         f"2ª mitad: {len(h2)} (hasta {h2[-1]['t']:%Y-%m-%d})",
+         "- El corte de 'deriva baja' se calculó solo con la 1ª mitad, para no hacer trampa con la 2ª.",
+         "- 'Se mantiene' = mejora al menos 5 puntos sobre 'Todas' en las dos mitades, con 20 casos o más cada una. "
+         "'Fuera de sesión' es al revés: debe rendir peor.",
+         "- ⚠ = menos de 30 casos.", "",
+         "## Todas las alertas", "", tabla(h1, h2), "",
+         "## Solo la primera alerta de cada setup (más independientes entre sí)", "",
+         tabla([x for x in h1 if x["primera"]], [x for x in h2 if x["primera"]]), ""]
+    texto = "\n".join(L)
+    with open(os.path.join(DATA_DIR, f"estabilidad_{nombre}.md"), "w") as f:
+        f.write(texto)
+    return texto
+
+
+# ------------------------------------------------------------------ confirmación en 5m
+W_MAX = 24                 # vigilancia máxima tras la alerta: 24 velas de 5m (2 h)
+W_DEFAULT = 12             # ventana de la tabla principal: 12 velas (60 min)
+HORIZON5 = HORIZON_H * 60 // 5
+SLIPPAGE = {"XAU/USD": 0.20}   # deslizamiento supuesto en órdenes pendientes (en precio)
+X_LIST = [0.0, 0.1, 0.2, 0.3, 0.5]   # cuánto pasa bajo el piso, en ATR de 15m
+PISOS = ["mecha", "cuerpo"]          # mecha = mínimo con mechas; cuerpo = mínimo de los cuerpos
+TIPOS = ["cierre", "toque"]          # cierre = vela de 5m que cierra bajo el nivel; toque = orden pendiente
+SL5 = ["máx", "acum", "rup", "1ATR"]  # rup = sobre los máximos de los últimos 30 min
+REF5 = ("máx", "1.5ATR")
+
+
+def agregar_15m(c5):
+    g = {}
+    for x in c5:
+        k = x["t"].replace(minute=(x["t"].minute // 15) * 15)
+        g.setdefault(k, []).append(x)
+    out = []
+    for k in sorted(g):
+        v = sorted(g[k], key=lambda x: x["t"])
+        if len(v) == 3:
+            out.append({"t": k, "o": v[0]["o"], "h": max(y["h"] for y in v),
+                        "l": min(y["l"] for y in v), "c": v[-1]["c"]})
+    return out
+
+
+def niveles5(s, entry, c5, brk):
+    a = s["atr"]
+    sls = {"máx": s["peak"] + SL_BUFFER_ATR * a,
+           "acum": s["acc_hi"] + SL_BUFFER_ATR * a,
+           "rup": max(x["h"] for x in c5[max(0, brk - 5):brk + 1]) + SL_BUFFER_ATR * a,
+           "1ATR": entry + a}
+    tps = {"1ATR": entry - a, "1.5ATR": entry - 1.5 * a, "2ATR": entry - 2 * a,
+           "3ATR": entry - 3 * a, "r50": s["peak"] - 0.5 * s["impulse"], "r100": s["base"]}
+    return sls, tps
+
+
+def resultado_entrada(c5, tr, cb, spread):
+    """R de una operación (cacheado). tr = {s, ei, entry, brk}. cb = (SL, TP)."""
+    cache = tr.setdefault("cache", {})
+    if cb not in cache:
+        ei = tr["ei"]
+        t_e = c5[ei]["t"]
+        fut = [x for x in c5[ei + 1: ei + 1 + HORIZON5] if x["t"] <= t_e + timedelta(hours=HORIZON_H)]
+        sls, tps = niveles5(tr["s"], tr["entry"], c5, tr["brk"])
+        cache[cb] = simular(fut, tr["entry"], sls[cb[0]], tps[cb[1]], spread)
+    return cache[cb]
+
+
+def preparar_items(sym, c15, c5):
+    spread = SPREAD.get(sym, 0.0)
+    times5 = [x["t"] for x in c5]
+    items = []
+    for s in generar_alertas(c15):
+        if s["tarde"] or (s["sl"] - s["price"]) < 3 * spread:
+            continue
+        t_alerta = s["vela_t"] + timedelta(minutes=CANDLE_MIN)
+        j0 = bisect.bisect_left(times5, t_alerta)
+        if j0 >= len(c5) or j0 < 8 or c5[j0]["t"] - t_alerta > timedelta(minutes=15):
+            continue
+        if j0 + W_MAX + HORIZON5 + 2 > len(c5):
+            continue  # todavía sin desenlace completo
+        s["j0"] = j0
+        items.append(s)
+    return items
+
+
+def buscar_ruptura(c5, s, piso, X, tipo, delay, slip):
+    j0 = s["j0"]
+    nivel = piso - X * s["atr"]
+    for k in range(j0, min(j0 + W_MAX, len(c5) - 1)):
+        x = c5[k]
+        if x["h"] > s["peak"]:
+            return None  # el setup se invalida: rompió el máximo antes de confirmar
+        if tipo == "cierre":
+            if x["c"] <= nivel:
+                e = k + delay
+                if e >= len(c5) or any(y["h"] > s["peak"] for y in c5[k + 1:e + 1]):
+                    return None
+                return {"k": k - j0, "ei": e, "entry": c5[e]["c"], "brk": k}
+        elif x["l"] <= nivel:
+            return {"k": k - j0, "ei": k, "entry": min(nivel, x["o"]) - slip, "brk": k}
+    return None
+
+
+def correr_variante(c5, items, piso, X, tipo, delay, sym):
+    slip = SLIPPAGE.get(sym, 0.0)
+    trades, vistos = [], set()
+    for s in items:
+        piso_p = s["acc_lo"] if piso == "mecha" else s["acc_body_lo"]
+        r = buscar_ruptura(c5, s, piso_p, X, tipo, delay, slip)
+        if r is None:
+            continue
+        key = (s["setup"], c5[r["ei"]]["t"])
+        if key in vistos:
+            continue
+        vistos.add(key)
+        trades.append({"s": s, "ei": r["ei"], "entry": r["entry"], "brk": r["brk"], "k": r["k"]})
+    return trades
+
+
+def directas(items, primera_solo):
+    out, vistos = [], set()
+    for s in items:
+        if primera_solo:
+            if s["setup"] in vistos:
+                continue
+            vistos.add(s["setup"])
+        out.append({"s": s, "ei": s["j0"] - 1, "entry": s["price"], "brk": s["j0"] - 1, "k": 0})
+    return out
+
+
+def _est(c5, trs, cb, spread):
+    rs = [resultado_entrada(c5, t, cb, spread) for t in trs]
+    rs = [r for r in rs if r]
+    if not rs:
+        return 0, 0, 0.0, 0.0
+    tot = sum(r[1] for r in rs)
+    return len(rs), sum(1 for r in rs if r[0] == "TP"), tot / len(rs), tot
+
+
+def analizar_confirmacion(sym, c15, c5):
+    spread = SPREAD.get(sym, 0.0)
+    items = preparar_items(sym, c15, c5)
+    if len(items) < 30:
+        return "Muy pocas alertas con velas de 5m para analizar la confirmación."
+    setups = len({s["setup"] for s in items})
+    mitad = items[0]["vela_t"] + (items[-1]["vela_t"] - items[0]["vela_t"]) / 2
+
+    # --- variantes (ventana W_MAX; luego se filtra por ventana)
+    variantes = {}
+    for piso in PISOS:
+        for X in X_LIST:
+            for tipo in TIPOS:
+                variantes[(piso, X, tipo)] = correr_variante(c5, items, piso, X, tipo, 0, sym)
+
+    def en_ventana(trs, W):
+        return [t for t in trs if t["k"] < W]
+
+    def nombre(v):
+        return f"{v[0]} {v[2]} {v[1]:g}"
+
+    dir_todas, dir_1 = directas(items, False), directas(items, True)
+
+    L = [f"# {sym} — confirmación en 5m al romper el piso de la acumulación", "",
+         f"- Periodo: {c5[0]['t']:%Y-%m-%d} a {c5[-1]['t']:%Y-%m-%d} | alertas evaluables: {len(items)} en {setups} setups "
+         f"(sin viernes tarde ni SL menor a 3 spreads)",
+         f"- Se vigila hasta {W_MAX} velas de 5m tras la alerta; el setup se anula si el precio supera el máximo de la subida antes de confirmar.",
+         f"- Objetivo y SL medidos desde la entrada. Referencia: SL sobre el máximo y TP {REF5[1]}. Spread {spread}, "
+         f"deslizamiento en órdenes pendientes {SLIPPAGE.get(sym, 0.0)}. Horizonte {HORIZON_H} h.",
+         "- 'cierre' = vela de 5m que cierra bajo el nivel (entras al cierre). 'toque' = orden pendiente que se activa al tocar el nivel. "
+         "El número es cuántos ATR de 15m bajo el piso. 'mecha' = mínimo con mechas; 'cuerpo' = mínimo de los cuerpos.",
+         "- Una operación por setup. ⚠ = menos de 30 casos.", ""]
+
+    # --- tabla principal
+    filas = []
+    for etiqueta, trs in (("Directa (todas)", dir_todas), ("Directa (1ª/setup)", dir_1)):
+        n, w, avg, tot = _est(c5, trs, REF5, spread)
+        filas.append([etiqueta, "100%", n, _tasa(w, n), f"{avg:+.2f}", f"{tot:+.1f}", "–"])
+    ranking = []
+    for v, trs in variantes.items():
+        ts = en_ventana(trs, W_DEFAULT)
+        n, w, avg, tot = _est(c5, ts, REF5, spread)
+        conf = len({t["s"]["setup"] for t in ts})
+        cayo = _med([(t["s"]["price"] - t["entry"]) / t["s"]["atr"] for t in ts]) if ts else 0.0
+        filas.append([nombre(v), f"{100 * conf / setups:.0f}%", n, _tasa(w, n), f"{avg:+.2f}", f"{tot:+.1f}", f"{cayo:.1f}"])
+        if n >= 30:
+            ranking.append((tot, v))
+    L += [f"## Entrada directa vs confirmada (ventana {W_DEFAULT} velas = {W_DEFAULT * 5} min)", "",
+          _tabla(["Variante", "Setups que confirman", "Ops", "Acierto", "R/op", "R total", "Ya cayó (ATR)"], filas), "",
+          "R total suma todas las operaciones: es la medida justa para comparar, porque confirmar reduce el número de operaciones. "
+          "'Ya cayó' = distancia entre el precio de la alerta y tu entrada.", ""]
+    ranking.sort(reverse=True)
+    if not ranking:
+        L.append("Ninguna variante llegó a 30 operaciones.")
+        return "\n".join(L)
+    top = [v for _, v in ranking[:3]]
+    mejor = top[0]
+
+    # --- tiempo hasta la ruptura
+    trs = variantes[mejor]
+    ks = [(t["k"] + 1) * 5 for t in trs]
+    cob = []
+    for W in (6, 10, 12, 18, 24):
+        c = len({t["s"]["setup"] for t in trs if t["k"] < W})
+        cob.append([f"{W} velas ({W * 5} min)", f"{100 * c / setups:.0f}%"])
+    L += [f"## ¿Cuánto tarda en confirmar? (variante: {nombre(mejor)})", "",
+          f"Tiempo mediano hasta la ruptura: {_med(ks)} min; el 75% ocurre antes de {_q(ks, .75):.0f} min; el 90%, antes de {_q(ks, .9):.0f} min.", "",
+          _tabla(["Ventana", "Setups que confirman"], cob), ""]
+
+    # --- cuadrícula SL x TP de la mejor
+    ts = en_ventana(variantes[mejor], W_DEFAULT)
+    fw, fr = [], []
+    for sn in SL5:
+        rw, rr = [f"SL {sn}"], [f"SL {sn}"]
+        for tn in TP_NAMES:
+            n, w, avg, tot = _est(c5, ts, (sn, tn), spread)
+            rw.append(_tasa(w, n))
+            rr.append(f"{avg:+.2f}" if n else "–")
+        fw.append(rw)
+        fr.append(rr)
+    cab = [""] + [f"TP {t}" for t in TP_NAMES]
+    L += [f"## Mejor variante: {nombre(mejor)} — % de aciertos por SL y TP", "", _tabla(cab, fw), "",
+          "## Ganancia promedio por operación (R)", "", _tabla(cab, fr), "",
+          "'rup' = SL sobre los máximos de los últimos 30 min antes de entrar.", ""]
+
+    # --- estabilidad de las 3 mejores
+    fe = []
+    for v in top:
+        ts = en_ventana(variantes[v], W_DEFAULT)
+        a = [t for t in ts if t["s"]["vela_t"] < mitad]
+        b = [t for t in ts if t["s"]["vela_t"] >= mitad]
+        na, wa, ra, ta = _est(c5, a, REF5, spread)
+        nb, wb, rb, tb = _est(c5, b, REF5, spread)
+        fe.append([nombre(v), f"{_tasa(wa, na)} n={na}", f"{ra:+.2f}", f"{_tasa(wb, nb)} n={nb}", f"{rb:+.2f}"])
+    L += ["## ¿Se mantiene en las dos mitades? (3 mejores)", "",
+          _tabla(["Variante", "1ª mitad", "R/op", "2ª mitad", "R/op"], fe), "",
+          "Ojo: elegí estas variantes por su resultado en todo el periodo, así que parte de su ventaja puede ser suerte. "
+          "Lo importante es que se mantengan en ambas mitades.", ""]
+
+    # --- sensibilidad al retraso (solo 'cierre')
+    cierres = [v for _, v in ranking if v[2] == "cierre"]
+    if cierres:
+        v = cierres[0]
+        fd = []
+        for d in (0, 1, 2):
+            tr = correr_variante(c5, items, v[0], v[1], "cierre", d, sym)
+            tr = en_ventana(tr, W_DEFAULT)
+            n, w, avg, tot = _est(c5, tr, REF5, spread)
+            fd.append([f"{d * 5} min", n, _tasa(w, n), f"{avg:+.2f}", f"{tot:+.1f}"])
+        L += [f"## ¿Y si entras tarde? (variante: {nombre(v)})", "",
+              _tabla(["Retraso tras el cierre", "Ops", "Acierto", "R/op", "R total"], fd), ""]
+
+    # --- sesión
+    fs = []
+    for etiqueta, trs_ in (("Directa (1ª/setup)", dir_1), (nombre(mejor), en_ventana(variantes[mejor], W_DEFAULT))):
+        for grupo, fn in (("NY+Londres", lambda t: t["s"]["ses"]["sesion"] == "Nueva York+Londres"),
+                          ("Resto", lambda t: t["s"]["ses"]["sesion"] != "Nueva York+Londres")):
+            sub = [t for t in trs_ if fn(t)]
+            n, w, avg, tot = _est(c5, sub, REF5, spread)
+            fs.append([etiqueta, grupo, n, _tasa(w, n), f"{avg:+.2f}", f"{tot:+.1f}"])
+    L += ["## Por sesión", "", _tabla(["Entrada", "Grupo", "Ops", "Acierto", "R/op", "R total"], fs), ""]
+
+    # --- CSV con las operaciones
+    os.makedirs(DATA_DIR, exist_ok=True)
+    nombre_f = sym.replace("/", "")
+    with open(os.path.join(DATA_DIR, f"confirmacion_{nombre_f}.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["variante", "setup", "alerta_t", "entrada_t", "entrada", "min_hasta_ruptura",
+                    "sesion", "resultado", "R"])
+        for v, trs_ in variantes.items():
+            for t in en_ventana(trs_, W_DEFAULT):
+                r = resultado_entrada(c5, t, REF5, spread)
+                if r:
+                    w.writerow([nombre(v), t["s"]["setup"], t["s"]["vela_t"].strftime("%Y-%m-%d %H:%M"),
+                                c5[t["ei"]]["t"].strftime("%Y-%m-%d %H:%M"), round(t["entry"], 3),
+                                (t["k"] + 1) * 5, t["s"]["ses"]["sesion"], r[0], round(r[1], 3)])
+    texto = "\n".join(L)
+    with open(os.path.join(DATA_DIR, f"confirmacion_{nombre_f}.md"), "w") as f:
+        f.write(texto)
+    return texto
+
+
+def confirmacion(sym, dias):
+    c15 = fetch_historial(sym, dias)
+    print(f"{sym}: {len(c15)} velas de 15m")
+    time.sleep(8)
+    c5 = fetch_historial(sym, dias, "5min", 5)
+    print(f"{sym}: {len(c5)} velas de 5m ({c5[0]['t']} a {c5[-1]['t']})")
+    return analizar_confirmacion(sym, c15, c5)
+
 # ------------------------------------------------------------------ avisos
 def mensaje(sym, s):
     ses = s["ses"]
@@ -658,6 +1020,19 @@ def main():
     modo = sys.argv[1] if len(sys.argv) > 1 else "run"
     if modo == "test":
         notificar("✅ Prueba del bot de alertas", "Si lees esto, las notificaciones funcionan.")
+        return
+    if modo == "confirmacion":
+        dias = int(os.environ.get("DIAS") or 365)
+        for sym in SYMBOLS:
+            texto = confirmacion(sym, dias)
+            print(texto)
+            notificar(f"📊 Confirmación 5m {sym} ({dias} días)", texto)
+        return
+    if modo == "estabilidad":
+        for sym in SYMBOLS:
+            texto = estabilidad(sym)
+            print(texto)
+            notificar(f"📊 Estabilidad {sym}", texto)
         return
     if modo in ("backtest", "historico"):
         dias = int(os.environ.get("DIAS") or 365)
