@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       modo:
-        description: "run / test / backtest / historico"
+        description: "run / test / backtest / historico / estabilidad / confirmacion"
         default: "run"
       dias:
         description: "Días de historial (solo para modo historico)"
