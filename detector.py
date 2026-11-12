@@ -953,14 +953,17 @@ def mensaje(sym, s):
 
 def telegram(text):
     token = os.environ["TELEGRAM_TOKEN"]
-    chat = os.environ["TELEGRAM_CHAT_ID"]
-    data = urllib.parse.urlencode({"chat_id": chat, "text": text[:3900]}).encode()
-    try:
-        urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage",
-                               data=data, timeout=30).read()
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Telegram {e.code}: {e.read().decode(errors='replace')}") from None
-
+    chats = [
+        os.environ["TELEGRAM_CHAT_ID"],
+        os.environ["TELEGRAM_CHAT_ID_2"]
+    ]
+    for chat in chats:
+        data = urllib.parse.urlencode({"chat_id": chat, "text": text[:3900]}).encode()
+        try:
+            urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage",
+                                   data=data, timeout=30).read()
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"Telegram {e.code}: {e.read().decode(errors='replace')}") from None
 
 def enviar_email(asunto, text):
     user = os.environ["EMAIL_USER"]
